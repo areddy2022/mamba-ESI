@@ -103,6 +103,8 @@ class MixerModel(nn.Module):
         self.residual_in_fp32 = residual_in_fp32
 
         self.embedding = nn.Embedding(vocab_size, d_model, **factory_kwargs)
+        self.embedding_proj = nn.Linear(d_model, d_model, **factory_kwargs)
+        self.injection_proj = nn.Linear(d_model, d_model, **factory_kwargs)
 
         # We change the order of residual and layer norm:
         # Instead of LN -> Attn / MLP -> Add, we do:
@@ -148,8 +150,18 @@ class MixerModel(nn.Module):
             for i, layer in enumerate(self.layers)
         }
 
-    def forward(self, input_ids, inference_params=None):
+    def forward(self, input_ids, question_embedding, inference_params=None):
         hidden_states = self.embedding(input_ids)
+        # Embedding search and injection
+        input_embeddings = self.embedding_proj(hidden_states)
+        similarity_scores = torch.einsum('bd,td->bt', question_embedding, input_embeddings)
+        top_k = min(similarity_scores.size(-1), 5)  # Select top-k relevant tokens
+        _, top_indices = torch.topk(similarity_scores, top_k, dim=-1)
+        relevant_hidden_states = hidden_states.gather(1,
+                                                      top_indices.unsqueeze(-1).expand(-1, -1, hidden_states.size(-1)))
+        injection_vectors = self.injection_proj(relevant_hidden_states)
+        hidden_states = hidden_states + injection_vectors.sum(1)
+
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(
@@ -191,6 +203,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         residual_in_fp32 = config.residual_in_fp32
         fused_add_norm = config.fused_add_norm
         pad_vocab_size_multiple = config.pad_vocab_size_multiple
+        self.question_embedding = nn.Linear(config.d_model, config.d_model)
         factory_kwargs = {"device": device, "dtype": dtype}
 
         super().__init__()
@@ -226,12 +239,13 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return self.backbone.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
 
-    def forward(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0):
+    def forward(self, input_ids, question_ids, position_ids=None, inference_params=None, num_last_tokens=0):
         """
         "position_ids" is just to be compatible with Transformer generation. We don't use it.
         num_last_tokens: if > 0, only return the logits for the last n tokens
         """
-        hidden_states = self.backbone(input_ids, inference_params=inference_params)
+        question_embedding = self.question_embedding(self.backbone.embedding(question_ids)).mean(1)
+        hidden_states = self.backbone(input_ids, question_embedding, inference_params=inference_params)
         if num_last_tokens > 0:
             hidden_states = hidden_states[:, -num_last_tokens:]
         lm_logits = self.lm_head(hidden_states)
